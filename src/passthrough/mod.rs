@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
@@ -134,6 +135,23 @@ impl InodeHandle {
                 let file = self.get_file()?;
                 stat_fd(&file, None)
             }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InodeState {
+    root: String,
+    id: InodeId,
+    mode: u32,
+}
+
+impl InodeState {
+    fn new(root: String, id: InodeId, mode: u32) -> Self {
+        InodeState {
+            root,
+            id,
+            mode,
         }
     }
 }
@@ -463,7 +481,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 
     /// Initialize the Passthrough file system.
-    pub fn import(&self) -> io::Result<()> {
+    pub fn import(&self) -> io::Result<InodeState> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
         let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
@@ -483,6 +501,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
 
+        let inode_state = InodeState::new(
+            self.cfg.root_dir.clone(),
+            id,
+            st.st.st_mode,
+        );
+
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(Arc::new(InodeData::new(
             fuse::ROOT_ID,
@@ -492,7 +516,40 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             st.st.st_mode,
         )));
 
-        Ok(())
+        Ok(inode_state)
+    }
+
+    pub fn restore_import(&self, inode_state: InodeState, ignore: bool) -> io::Result<InodeState> {
+        let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
+        if self.cfg.root_dir == inode_state.root || ignore {
+            let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
+
+            let (path_fd, handle_opt, _st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
+                .map_err(|e| {
+                    error!("fuse: import: failed to get file or handle: {:?}", e);
+                    e
+                })?;
+            let handle = if let Some(h) = handle_opt {
+                InodeHandle::Handle(self.to_openable_handle(h)?)
+            } else {
+                InodeHandle::File(path_fd)
+            };
+
+            unsafe { libc::umask(0o000) };
+
+            // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
+            self.inode_map.insert(Arc::new(InodeData::new(
+                fuse::ROOT_ID,
+                handle,
+                2,
+                inode_state.id,
+                inode_state.mode,
+            )));
+
+            Ok(inode_state)
+        } else {
+            self.import()
+        }
     }
 
     /// Get the list of file descriptors which should be reserved across live upgrade.

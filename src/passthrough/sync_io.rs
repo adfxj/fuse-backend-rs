@@ -302,7 +302,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         if self.cfg.do_import {
-            self.import()?;
+            let _ = self.import()?;
         }
 
         let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
