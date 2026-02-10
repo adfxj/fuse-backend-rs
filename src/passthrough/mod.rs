@@ -139,7 +139,7 @@ impl InodeHandle {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct InodeState {
     root: String,
     id: InodeId,
