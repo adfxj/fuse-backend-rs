@@ -45,6 +45,7 @@ use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
+use crate::bytes_to_cstr;
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -691,6 +692,16 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             Ok(inode)
         }
+    }
+
+    pub fn do_restore_lookup(&self, store_hash_map: Vec<(Inode, String)>) -> io::Result<()> {
+        for (id, name) in store_hash_map {
+            let name = CString::new(name).expect("Cstring: failed");
+            let name = name.as_c_str();
+            let _ = self.do_lookup(id, name)?;
+        }
+
+        Ok(())
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {

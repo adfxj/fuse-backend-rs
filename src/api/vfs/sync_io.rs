@@ -82,6 +82,7 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => self.lookup_pseudo(fs, idata, ctx, name),
             (Right(fs), idata) => {
                 // parent is in an underlying rootfs
+                self.store_lookups.push((idata.ino(), name.clone().to_str().unwrap().to_string()));
                 let mut entry = fs.lookup(ctx, idata.ino(), name)?;
                 // lookup success, hash it to a real fuse inode
                 self.convert_entry(idata.fs_idx(), entry.inode, &mut entry)
