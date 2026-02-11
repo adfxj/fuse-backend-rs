@@ -179,6 +179,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(())
     }
 
+    pub fn do_resore_open(&self, store_open: Vec<(u64, u32, u32)>) -> io::Result<()> {
+        for (inode, flags, fuse_flags) in store_open {
+            let _ = self.do_open(inode, flags, fuse_flags);
+        }
+
+        Ok(())
+    }
+
     fn do_open(
         &self,
         inode: Inode,

@@ -325,6 +325,7 @@ pub struct Vfs {
     remove_pseudo_root: bool,
     id_mapping: Option<(u32, u32, u32)>,
     store_lookups: ArcSwap<Vec<(u64, String)>>,
+    store_open: ArcSwap<Vec<(u64, u32, u32)>>,
 }
 
 impl Default for Vfs {
@@ -350,6 +351,7 @@ impl Vfs {
                 _ => Some(opts.id_mapping),
             },
             store_lookups: ArcSwap::new(Arc::new(Vec::new())),
+            store_open: ArcSwap::new(Arc::new(Vec::new())),
         }
     }
 
@@ -367,6 +369,11 @@ impl Vfs {
     /// get store lookups
     pub fn get_store_lookups(&self) -> Vec<(u64, String)> {
         self.store_lookups.load().deref().deref().clone()
+    }
+
+    /// get store opens
+    pub fn get_store_opens(&self) -> Vec<(u64, u32, u32)> {
+        self.store_open.load().deref().deref().clone()
     }
 
     /// Get a snapshot of the current vfs options.
