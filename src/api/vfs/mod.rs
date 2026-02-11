@@ -429,6 +429,11 @@ impl Vfs {
         Ok(index)
     }
 
+    /// Get capabilities of a mounted file system.
+    pub fn get_capable(&self) -> u64 {
+        self.opts.load().out_opts.bits()
+    }
+
     /// Restore a backend file system to path
     #[cfg(feature = "persist")]
     pub fn restore_mount(&self, fs: BackFileSystem, fs_idx: VfsIndex, path: &str) -> Result<()> {
@@ -697,12 +702,9 @@ pub mod persist {
     use versionize::{VersionMap, Versionize, VersionizeResult};
     use versionize_derive::Versionize;
 
-    use crate::api::{
-        filesystem::FsOptions,
-        pseudo_fs::persist::PseudoFsState,
-        vfs::{VfsError, VfsResult},
-        Vfs, VfsOptions,
-    };
+    use crate::{api::{
+        Vfs, VfsIndex, VfsOptions, filesystem::FsOptions, pseudo_fs::persist::PseudoFsState, vfs::{VfsError, VfsResult}
+    }, passthrough::SnapshotStore};
 
     /// VfsState stores the state of the VFS.
     #[derive(Versionize, Debug)]
@@ -896,6 +898,12 @@ pub mod persist {
                 .map_err(|e| VfsError::Persist(format!("Failed to restore Vfs root: {:?}", e)))?;
 
             Ok(())
+        }
+
+        pub fn save_filesystem(&self, idx: VfsIndex) -> VfsResult<SnapshotStore> {
+            let fs = self.get_fs_by_idx(idx).map_err(|e| VfsError::Persist(format!("Failed to get fs by index {} with error: {:?}", idx, e)))?;
+            fs.get_snapshot(idx)
+                .map_err(|e| VfsError::Persist(format!("Failed to restore Vfs root: {:?}", e)))
         }
     }
 

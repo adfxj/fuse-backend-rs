@@ -29,7 +29,7 @@ use crate::bytes_to_cstr;
 use crate::transport::FsCacheReqHandler;
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
-    fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
+    pub fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
         if !is_safe_inode(data.mode) {
             Err(ebadf())
@@ -199,6 +199,16 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handle_map.insert(handle, data);
 
+        // Save snapshot if needed
+        if self.cfg.do_snapshot {
+            let mut snapshot_store = self.snapshot_data.get_map_mut();
+            SnapshotData::insert_open_locked(
+                snapshot_store.deref_mut(),
+                inode,
+                Arc::new(HandelOpen::new(inode, flags, fuse_flags, handle)),
+            );
+        }
+
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
             // We only set the direct I/O option on files.
@@ -346,6 +356,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     fn destroy(&self) {
         self.handle_map.clear();
         self.inode_map.clear();
+
+        if self.cfg.do_snapshot {
+            self.snapshot_data.clear();
+        }
 
         if let Err(e) = self.import() {
             error!("fuse: failed to destroy instance, {:?}", e);
@@ -594,6 +608,16 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let data = HandleData::new(entry.inode, file, args.flags);
 
             self.handle_map.insert(handle, data);
+            // Save snapshot if needed
+            if self.cfg.do_snapshot {
+                let mut snapshot_store = self.snapshot_data.get_map_mut();
+                SnapshotData::insert_create_locked(
+                    snapshot_store.deref_mut(),
+                    parent,
+                    Arc::new(HandelCreate::new(ctx.uid, ctx.gid, parent, name.to_str().unwrap().to_string(), args, handle)),
+                );
+            }
+
             Some(handle)
         } else {
             None
@@ -1330,6 +1354,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         } else {
             Ok(res as u64)
         }
+    }
+
+
+    fn get_snapshot(&self, _idx: u8) -> io::Result<SnapshotStore> {
+        Ok(self.snapshot_data.get_map().clone())
     }
 }
 

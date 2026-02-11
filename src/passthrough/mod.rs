@@ -23,9 +23,10 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard, RwLockReadGuard};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
 pub use self::config::{CachePolicy, Config};
@@ -37,9 +38,9 @@ use self::util::{
     ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
     UniqueInodeGenerator,
 };
-use crate::abi::fuse_abi as fuse;
+use crate::abi::fuse_abi::{self as fuse, CreateIn, FOPEN_IN_KILL_SUIDGID, OpenOptions};
 use crate::abi::fuse_abi::Opcode;
-use crate::api::filesystem::Entry;
+use crate::api::filesystem::{Entry, FileSystem, FsOptions};
 use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
@@ -341,6 +342,142 @@ impl HandleMap {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InodeParent {
+    inode: Inode,
+    id: InodeId,
+    // File type and mode
+    mode: u32,
+    name: String,
+}
+
+impl InodeParent {
+    fn new(inode: Inode, id: InodeId, mode: u32, name: String) -> Self {
+        InodeParent {
+            inode,
+            id,
+            mode,
+            name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandelOpen {
+    inode: Inode,
+    flag: u32,
+    fuse_flags: u32,
+    handle: u64,
+}
+
+impl HandelOpen {
+    fn new(inode: Inode, flag: u32, fuse_flags: u32, handle: u64) -> Self {
+        HandelOpen {
+            inode,
+            flag,
+            fuse_flags,
+            handle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandelCreate {
+    uid: u32,
+    gid: u32,
+    inode: Inode,
+    name: String,
+    args: CreateIn,
+    handle: u64,
+}
+
+impl HandelCreate {
+    fn new(uid: u32, gid: u32, inode: Inode, name: String, args: CreateIn, handle: u64) -> Self {
+        HandelCreate {
+            uid,
+            gid,
+            inode,
+            name,
+            args,
+            handle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgetNode {
+    inode: Inode,
+    count: u64,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SnapshotStore {
+    inode_parent: BTreeMap<Inode, Arc<InodeParent>>,
+    handle_open: BTreeMap<Inode, Arc<HandelOpen>>,
+    handle_create: BTreeMap<Inode, Arc<HandelCreate>>,
+}
+
+#[derive(Debug, Default)]
+pub struct SnapshotData {
+    snapshot: RwLock<SnapshotStore>,
+}
+
+impl SnapshotData {
+    fn new() -> Self {
+        SnapshotData {
+            snapshot: RwLock::new(Default::default()),
+        }
+    }
+
+    fn clear(&self) {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        self.snapshot.write().unwrap().inode_parent.clear();
+        self.snapshot.write().unwrap().handle_open.clear();
+        self.snapshot.write().unwrap().handle_create.clear();
+    }
+
+    fn get_map_mut(&self) -> RwLockWriteGuard<'_, SnapshotStore> {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        self.snapshot.write().unwrap()
+    }
+
+    fn get_map(&self) -> RwLockReadGuard<'_, SnapshotStore> {
+        self.snapshot.read().unwrap()
+    }
+
+    fn insert_parent(&self, inode: Inode, data: Arc<InodeParent>) {
+        let mut snapshot_store = self.get_map_mut();
+
+        Self::insert_parent_locked(snapshot_store.deref_mut(), inode, data)
+    }
+
+    fn insert_parent_locked(snapshot_store: &mut SnapshotStore, inode: Inode, data: Arc<InodeParent>) {
+        snapshot_store.inode_parent.insert(inode, data);
+    }
+
+    fn insert_open(&self, inode: Inode, data: Arc<HandelOpen>) {
+        let mut snapshot_store = self.get_map_mut();
+
+        Self::insert_open_locked(snapshot_store.deref_mut(), inode, data)
+    }
+
+    fn insert_open_locked(snapshot_store: &mut SnapshotStore, inode: Inode, data: Arc<HandelOpen>) {
+        snapshot_store.handle_open.insert(inode, data);
+    }
+
+    fn insert_create(&self, inode: Inode, data: Arc<HandelCreate>) {
+        let mut snapshot_store = self.get_map_mut();
+
+        Self::insert_create_locked(snapshot_store.deref_mut(), inode, data)
+    }
+
+    fn insert_create_locked(snapshot_store: &mut SnapshotStore, inode: Inode, data: Arc<HandelCreate>) {
+        snapshot_store.handle_create.insert(inode, data);
+    }
+}
+
+
 /// A file system that simply "passes through" all requests it receives to the underlying file
 /// system.
 ///
@@ -394,6 +531,9 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // Whether per-file DAX feature is enabled.
     // Init from guest kernel Init cmd of fuse fs.
     perfile_dax: AtomicBool,
+
+    // Save snapshot data, used to restore map
+    snapshot_data: SnapshotData,
 
     dir_entry_timeout: Duration,
     dir_attr_timeout: Duration,
@@ -454,6 +594,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             no_readdir: AtomicBool::new(cfg.no_readdir),
             seal_size: AtomicBool::new(cfg.seal_size),
             perfile_dax: AtomicBool::new(false),
+            snapshot_data: SnapshotData::new(),
             dir_entry_timeout,
             dir_attr_timeout,
             cfg,
@@ -483,6 +624,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
 
+        // Save snapshot
+        if self.cfg.do_snapshot {
+            self.snapshot_data.insert_parent(fuse::ROOT_ID, Arc::new(InodeParent::new(fuse::ROOT_ID, id, st.st.st_mode, self.cfg.root_dir.clone())));
+        }
+
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(Arc::new(InodeData::new(
             fuse::ROOT_ID,
@@ -495,9 +641,193 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(())
     }
 
+    /// Restore the Passthrough file system.
+    pub fn do_restore_import(&self, restore_node: Arc<InodeParent>) -> io::Result<()> {
+        let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
+
+        let (path_fd, handle_opt, _st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
+            .map_err(|e| {
+                error!("fuse: import: failed to get file or handle: {:?}", e);
+                e
+            })?;
+        let handle = if let Some(h) = handle_opt {
+            InodeHandle::Handle(self.to_openable_handle(h)?)
+        } else {
+            InodeHandle::File(path_fd)
+        };
+
+        // Safe because this doesn't modify any memory and there is no need to check the return
+        // value because this system call always succeeds. We need to clear the umask here because
+        // we want the client to be able to set all the bits in the mode.
+        unsafe { libc::umask(0o000) };
+
+        // Save snapshot
+        if self.cfg.do_snapshot {
+            self.snapshot_data.insert_parent(fuse::ROOT_ID, restore_node.clone());
+        }
+
+        // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
+        self.inode_map.insert(Arc::new(InodeData::new(
+            fuse::ROOT_ID,
+            handle,
+            2,
+            restore_node.id,
+            restore_node.mode,
+        )));
+
+        Ok(())
+    }
+
     /// Get the list of file descriptors which should be reserved across live upgrade.
     pub fn keep_fds(&self) -> Vec<RawFd> {
         vec![self.proc_self_fd.as_raw_fd()]
+    }
+
+    fn do_restore_init(&self, capable: FsOptions) {
+        // !cfg.do_import means we are under vfs, in which case capable is already
+        // negotiated and must be honored.
+        if (!self.cfg.do_import || self.cfg.writeback)
+            && capable.contains(FsOptions::WRITEBACK_CACHE) {
+            self.writeback.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.no_open)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPEN) {
+            self.no_open.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.no_opendir)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR) {
+            self.no_opendir.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.killpriv_v2)
+            && capable.contains(FsOptions::HANDLE_KILLPRIV_V2) {
+            self.killpriv_v2.store(true, Ordering::Relaxed);
+        }
+
+        if capable.contains(FsOptions::PERFILE_DAX) {
+            self.perfile_dax.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // Restore from snapshot
+    pub fn do_restore(&self, snapshot_store: SnapshotStore, capable: FsOptions) {
+        if !self.cfg.do_snapshot {
+            return;
+        }
+
+        self.do_restore_init(capable);
+
+        for (inode, inode_parent) in snapshot_store.inode_parent.iter() {
+            if *inode == fuse::ROOT_ID {
+                self.do_restore_import(inode_parent.clone());
+            } else {
+                self.do_restore_lookup(inode.clone(), inode_parent.clone());
+            }
+        }
+
+        for (_key, handle_open) in snapshot_store.handle_open.iter() {
+            self.do_restore_open(handle_open.inode, handle_open.flag, handle_open.fuse_flags, handle_open.handle);
+        }
+
+        for (_key, handle_create) in snapshot_store.handle_create.iter() {
+            let name = CString::new(handle_create.name.clone()).expect("Cstring: failed");
+            let name = name.as_c_str();
+            self.do_restore_create(handle_create.uid, handle_create.gid, handle_create.inode, name, handle_create.args, handle_create.handle);
+        }
+    }
+
+    fn do_restore_open(
+        &self,
+        inode: Inode,
+        flags: u32,
+        fuse_flags: u32,
+        handle: u64
+    ) -> io::Result <()> {
+        // Save snapshot if needed
+        if self.cfg.do_snapshot {
+            let mut snapshot_store = self.snapshot_data.get_map_mut();
+            SnapshotData::insert_open_locked(
+                snapshot_store.deref_mut(),
+                inode,
+                Arc::new(HandelOpen::new(inode, flags, fuse_flags, handle)),
+            );
+        }
+
+        let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+            && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+        {
+            self::drop_cap_fsetid()?
+        } else {
+            None
+        };
+        let file = self.open_inode(inode, flags as i32)?;
+        drop(killpriv);
+
+        let data = HandleData::new(inode, file, flags);
+        self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handle_map.insert(handle, data);
+
+        Ok(())
+    }
+
+    fn do_restore_create(
+        &self,
+        uid: u32,
+        gid: u32,
+        parent: Inode,
+        name: &CStr,
+        args: CreateIn,
+        handle: u64,
+    ) -> io::Result <()> {
+        // Save snapshot if needed
+        if self.cfg.do_snapshot {
+            let mut snapshot_store = self.snapshot_data.get_map_mut();
+            SnapshotData::insert_create_locked(
+                snapshot_store.deref_mut(),
+                parent,
+                Arc::new(HandelCreate::new(uid, gid, parent, name.to_str().unwrap().to_string(), args, handle)),
+            );
+        }
+
+        self.validate_path_component(name)?;
+
+        let dir = self.inode_map.get(parent)?;
+        let dir_file = dir.get_file()?;
+
+        let new_file = {
+            let (_uid, _gid) = set_creds(uid, gid)?;
+
+            let flags = self.get_writeback_open_flags(args.flags as i32);
+            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
+        };
+
+        let entry = self.do_lookup(parent, name)?;
+        let file = match new_file {
+            // File didn't exist, now created by create_file_excl()
+            Some(f) => f,
+            // File exists, and args.flags doesn't contain O_EXCL. Now let's open it with
+            // open_inode().
+            None => {
+                // Cap restored when _killpriv is dropped
+                let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+                    && (args.fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+                {
+                    self::drop_cap_fsetid()?
+                } else {
+                    None
+                };
+
+                let (_uid, _gid) = set_creds(uid, gid)?;
+                self.open_inode(entry.inode, args.flags as i32)?
+            }
+        };
+
+        if !self.no_open.load(Ordering::Relaxed) {
+            let data = HandleData::new(entry.inode, file, args.flags);
+            self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.handle_map.insert(handle, data);
+        }
+
+        Ok(())
     }
 
     fn readlinkat(dfd: i32, pathname: &CStr) -> io::Result<PathBuf> {
@@ -636,6 +966,92 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         }
     }
 
+    fn do_restore_lookup(&self, inode: Inode, inode_parent: Arc<InodeParent>) -> io::Result<()> {
+        let name = CString::new(inode_parent.name.clone()).expect("Cstring: failed");
+        let name = name.as_c_str();
+        let name =
+            if inode_parent.inode == fuse::ROOT_ID && name.to_bytes_with_nul().starts_with(PARENT_DIR_CSTR) {
+                // Safe as this is a constant value and a valid C string.
+                CStr::from_bytes_with_nul(CURRENT_DIR_CSTR).unwrap()
+            } else {
+                name
+            };
+
+        let dir = self.inode_map.get(inode_parent.inode)?;
+        let dir_file = dir.get_file()?;
+        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &dir_file, name)?;
+        let id = InodeId::from_stat(&st);
+
+        let mut found = None;
+        'search: loop {
+            match self.inode_map.get_alt(&id, handle_opt.as_ref()) {
+                // No existing entry found
+                None => break 'search,
+                Some(data) => {
+                    let curr = data.refcount.load(Ordering::Acquire);
+                    // forgot_one() has just destroyed the entry, retry...
+                    if curr == 0 {
+                        continue 'search;
+                    }
+
+                    // Saturating add to avoid integer overflow, it's not realistic to saturate u64.
+                    let new = curr.saturating_add(1);
+
+                    // Synchronizes with the forgot_one()
+                    if data
+                        .refcount
+                        .compare_exchange(curr, new, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        found = Some(data.inode);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if found.is_none() {
+            let handle = if let Some(h) = handle_opt.clone() {
+                InodeHandle::Handle(self.to_openable_handle(h)?)
+            } else {
+                InodeHandle::File(path_fd)
+            };
+
+            // Write guard get_alt_locked() and insert_lock() to avoid race conditions.
+            let mut inodes = self.inode_map.get_map_mut();
+
+            // Lookup inode_map again after acquiring the inode_map lock, as there might be another
+            // racing thread already added an inode with the same id while we're not holding
+            // the lock. If so just use the newly added inode, otherwise the inode will be replaced
+            // and results in EBADF.
+            match InodeMap::get_alt_locked(inodes.deref(), &id, handle_opt.as_ref()) {
+                Some(data) => {
+                    // An inode was added concurrently while we did not hold a lock on
+                    // `self.inodes_map`, so we use that instead. `handle` will be dropped.
+                    data.refcount.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {
+                    self.next_inode.fetch_add(1, Ordering::Relaxed);
+                    InodeMap::insert_locked(
+                        inodes.deref_mut(),
+                        Arc::new(InodeData::new(inode, handle, 1, inode_parent.id, inode_parent.mode)),
+                    );
+
+                    if self.cfg.do_snapshot {
+                        let mut snapshot_store = self.snapshot_data.get_map_mut();
+                        SnapshotData::insert_parent_locked(
+                            snapshot_store.deref_mut(),
+                            inode,
+                            inode_parent.clone(),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let name =
             if parent == fuse::ROOT_ID && name.to_bytes_with_nul().starts_with(PARENT_DIR_CSTR) {
@@ -715,6 +1131,16 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                         inodes.deref_mut(),
                         Arc::new(InodeData::new(inode, handle, 1, id, st.st.st_mode)),
                     );
+
+                    if self.cfg.do_snapshot {
+                        let mut snapshot_store = self.snapshot_data.get_map_mut();
+                        SnapshotData::insert_parent_locked(
+                            snapshot_store.deref_mut(),
+                            inode,
+                            Arc::new(InodeParent::new(parent, id,  st.st.st_mode, name.clone().to_str().unwrap().to_string())),
+                        );
+                    }
+
                     inode
                 }
             }

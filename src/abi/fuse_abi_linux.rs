@@ -10,6 +10,7 @@ use std::fmt::{Debug, Formatter};
 use std::mem;
 
 use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 
 pub use libc::{
@@ -911,7 +912,7 @@ pub struct OpenIn {
 unsafe impl ByteValued for OpenIn {}
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, Serialize, Deserialize)]
 pub struct CreateIn {
     pub flags: u32,
     pub mode: u32,

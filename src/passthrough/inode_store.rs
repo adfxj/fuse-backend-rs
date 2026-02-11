@@ -4,11 +4,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::file_handle::FileHandle;
 use super::statx::StatExt;
 use super::{Inode, InodeData, InodeHandle};
 
-#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug, Serialize, Deserialize)]
 /// Identify an inode in `PassthroughFs` by `InodeId`.
 pub struct InodeId {
     pub ino: libc::ino64_t,
