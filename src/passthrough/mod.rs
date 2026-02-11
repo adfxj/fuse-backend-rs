@@ -698,7 +698,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         for (id, name) in store_hash_map {
             let name = CString::new(name).expect("Cstring: failed");
             let name = name.as_c_str();
-            let _ = self.do_lookup(id, name)?;
+            let _ = self.do_lookup(id, name);
         }
 
         Ok(())
