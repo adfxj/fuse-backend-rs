@@ -324,7 +324,7 @@ pub struct Vfs {
     lock: Mutex<()>,
     remove_pseudo_root: bool,
     id_mapping: Option<(u32, u32, u32)>,
-    store_lookups: Vec<(u64, String)>,
+    store_lookups: ArcSwap<Vec<(u64, String)>>,
 }
 
 impl Default for Vfs {
@@ -349,7 +349,7 @@ impl Vfs {
                 0 => None,
                 _ => Some(opts.id_mapping),
             },
-            store_lookups: Vec::new(),
+            store_lookups: ArcSwap::new(Arc::new(Vec::new())),
         }
     }
 
@@ -364,8 +364,9 @@ impl Vfs {
         self.initialized.load(Ordering::Acquire)
     }
 
+    /// get store lookups
     pub fn get_store_lookups(&self) -> Vec<(u64, String)> {
-        self.store_lookups.clone()
+        self.store_lookups.load().deref().deref().clone()
     }
 
     /// Get a snapshot of the current vfs options.
