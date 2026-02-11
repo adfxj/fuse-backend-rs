@@ -120,7 +120,7 @@ pub mod api;
 
 #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 pub mod overlayfs;
-#[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
+//#[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 pub mod passthrough;
 pub mod transport;
 

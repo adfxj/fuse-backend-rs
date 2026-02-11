@@ -532,8 +532,18 @@ impl FileSystem for Vfs {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
         match self.get_real_rootfs(inode)? {
-            (Left(fs), idata) => fs.opendir(ctx, idata.ino(), flags),
-            (Right(fs), idata) => fs.opendir(ctx, idata.ino(), flags),
+            (Left(fs), idata) => {
+                let mut stor_opens = self.store_open.load().deref().deref().clone();
+                stor_opens.push((idata.ino(), flags | (libc::O_DIRECTORY as u32), 0));
+                self.store_open.store(Arc::new(stor_opens));
+                fs.opendir(ctx, idata.ino(), flags)
+            },
+            (Right(fs), idata) => {
+                let mut stor_opens = self.store_open.load().deref().deref().clone();
+                stor_opens.push((idata.ino(), flags | (libc::O_DIRECTORY as u32), 0));
+                self.store_open.store(Arc::new(stor_opens));
+                fs.opendir(ctx, idata.ino(), flags)
+            },
         }
     }
 
