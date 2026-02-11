@@ -29,7 +29,7 @@ use crate::bytes_to_cstr;
 use crate::transport::FsCacheReqHandler;
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
-    fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
+    pub fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
         if !is_safe_inode(data.mode) {
             Err(ebadf())
@@ -594,6 +594,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let data = HandleData::new(entry.inode, file, args.flags);
 
             self.handle_map.insert(handle, data);
+
             Some(handle)
         } else {
             None
@@ -1330,6 +1331,41 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         } else {
             Ok(res as u64)
         }
+    }
+
+
+    fn get_snapshot(&self, _idx: u8) -> io::Result<SnapshotStore> {
+        let mut snapshot_data = SnapshotStore::new();
+        snapshot_data.next_handle = self.next_handle.load(Ordering::Relaxed);
+        snapshot_data.next_inode = self.next_inode.load(Ordering::Relaxed);
+
+        for (inode, data) in self.inode_map.inodes.read().unwrap().data.iter() {
+            snapshot_data.inode_map.insert(
+                *inode,
+                Arc::new(
+                    InodeMapData {
+                        inode: data.inode,
+                        id: data.id,
+                        refcount: data.refcount.load(Ordering::Relaxed),
+                        mode: data.mode,
+                        parent: data.parent,
+                        name: data.name.clone(),
+                    }
+                ));
+        }
+
+        for (handle, data) in self.handle_map.handles.read().unwrap().iter() {
+            snapshot_data.handle_map.insert(
+                *handle,
+                Arc::new(
+                    HandleMapData {
+                        inode: data.inode,
+                        open_flags: data.open_flags.load(Ordering::Relaxed),
+                    }
+                ));
+        }
+
+        Ok(snapshot_data)
     }
 }
 

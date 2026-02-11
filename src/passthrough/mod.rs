@@ -23,9 +23,10 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard, RwLockReadGuard};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
 pub use self::config::{CachePolicy, Config};
@@ -37,9 +38,9 @@ use self::util::{
     ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
     UniqueInodeGenerator,
 };
-use crate::abi::fuse_abi as fuse;
+use crate::abi::fuse_abi::{self as fuse, CreateIn, FOPEN_IN_KILL_SUIDGID, OpenOptions};
 use crate::abi::fuse_abi::Opcode;
-use crate::api::filesystem::Entry;
+use crate::api::filesystem::{Entry, FileSystem, FsOptions};
 use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
@@ -141,23 +142,27 @@ impl InodeHandle {
 /// Represents an inode in `PassthroughFs`.
 #[derive(Debug)]
 pub struct InodeData {
-    inode: Inode,
+    pub inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     handle: InodeHandle,
-    id: InodeId,
-    refcount: AtomicU64,
+    pub id: InodeId,
+    pub refcount: AtomicU64,
     // File type and mode
-    mode: u32,
+    pub mode: u32,
+    pub parent: Inode,
+    pub name: String,
 }
 
 impl InodeData {
-    fn new(inode: Inode, f: InodeHandle, refcount: u64, id: InodeId, mode: u32) -> Self {
+    fn new(inode: Inode, f: InodeHandle, refcount: u64, id: InodeId, mode: u32, parent: Inode, name: String) -> Self {
         InodeData {
             inode,
             handle: f,
             id,
             refcount: AtomicU64::new(refcount),
             mode,
+            parent,
+            name,
         }
     }
 
@@ -292,8 +297,8 @@ impl HandleData {
     }
 }
 
-struct HandleMap {
-    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+pub struct HandleMap {
+    pub handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
 }
 
 impl HandleMap {
@@ -338,6 +343,42 @@ impl HandleMap {
             .filter(|hd| hd.inode == inode)
             .cloned()
             .ok_or_else(ebadf)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InodeMapData {
+    inode: Inode,
+    id: InodeId,
+    refcount: u64,
+    // File type and mode
+    mode: u32,
+    parent: Inode,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HandleMapData {
+    inode: Inode,
+    open_flags: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SnapshotStore {
+    inode_map: BTreeMap<Inode, Arc<InodeMapData>>,
+    handle_map: BTreeMap<Inode, Arc<HandleMapData>>,
+    next_inode: u64,
+    next_handle: u64,
+}
+
+impl SnapshotStore {
+    fn new() -> Self {
+        SnapshotStore {
+            inode_map: BTreeMap::new(),
+            handle_map: BTreeMap::new(),
+            next_inode: 0,
+            next_handle: 0,
+        }
     }
 }
 
@@ -490,6 +531,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             2,
             id,
             st.st.st_mode,
+            fuse::ROOT_ID,
+            "".to_string(),
         )));
 
         Ok(())
@@ -498,6 +541,150 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Get the list of file descriptors which should be reserved across live upgrade.
     pub fn keep_fds(&self) -> Vec<RawFd> {
         vec![self.proc_self_fd.as_raw_fd()]
+    }
+
+    fn do_restore_init(&self, capable: FsOptions) -> io::Result<()> {
+        self.import()?;
+
+        // !cfg.do_import means we are under vfs, in which case capable is already
+        // negotiated and must be honored.
+        if (!self.cfg.do_import || self.cfg.writeback)
+            && capable.contains(FsOptions::WRITEBACK_CACHE) {
+            self.writeback.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.no_open)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPEN) {
+            self.no_open.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.no_opendir)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR) {
+            self.no_opendir.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.killpriv_v2)
+            && capable.contains(FsOptions::HANDLE_KILLPRIV_V2) {
+            self.killpriv_v2.store(true, Ordering::Relaxed);
+        }
+
+        if capable.contains(FsOptions::PERFILE_DAX) {
+            self.perfile_dax.store(true, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    fn restore_inode(&self, inode: Inode, inode_map: &Arc<InodeMapData>) -> io::Result<()> {
+        let name = CString::new(inode_map.name.clone()).expect("Cstring: failed");
+        let mut name = name.as_c_str();
+        name =
+            if inode_map.parent == fuse::ROOT_ID && name.to_bytes_with_nul().starts_with(PARENT_DIR_CSTR) {
+                // Safe as this is a constant value and a valid C string.
+                CStr::from_bytes_with_nul(CURRENT_DIR_CSTR).unwrap()
+            } else {
+                name
+            };
+
+        let dir = self.inode_map.get(inode_map.parent)?;
+        let dir_file = dir.get_file()?;
+        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &dir_file, name)?;
+        let id = InodeId::from_stat(&st);
+
+        let mut found = None;
+        'search: loop {
+            match self.inode_map.get_alt(&id, handle_opt.as_ref()) {
+                // No existing entry found
+                None => break 'search,
+                Some(data) => {
+                    let curr = data.refcount.load(Ordering::Acquire);
+                    // forgot_one() has just destroyed the entry, retry...
+                    if curr == 0 {
+                        continue 'search;
+                    }
+
+                    // Saturating add to avoid integer overflow, it's not realistic to saturate u64.
+                    let new = curr.saturating_add(1);
+
+                    // Synchronizes with the forgot_one()
+                    if data
+                        .refcount
+                        .compare_exchange(curr, new, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        found = Some(data.inode);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if found.is_none() {
+            let handle = if let Some(h) = handle_opt.clone() {
+                InodeHandle::Handle(self.to_openable_handle(h)?)
+            } else {
+                InodeHandle::File(path_fd)
+            };
+
+            // Write guard get_alt_locked() and insert_lock() to avoid race conditions.
+            let mut inodes = self.inode_map.get_map_mut();
+
+            // Lookup inode_map again after acquiring the inode_map lock, as there might be another
+            // racing thread already added an inode with the same id while we're not holding
+            // the lock. If so just use the newly added inode, otherwise the inode will be replaced
+            // and results in EBADF.
+            match InodeMap::get_alt_locked(inodes.deref(), &id, handle_opt.as_ref()) {
+                Some(data) => {
+                    // An inode was added concurrently while we did not hold a lock on
+                    // `self.inodes_map`, so we use that instead. `handle` will be dropped.
+                    data.refcount.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {
+                    let _ = self.allocate_inode(inodes.deref(), &id, handle_opt.as_ref())?;
+
+                    InodeMap::insert_locked(
+                        inodes.deref_mut(),
+                        Arc::new(InodeData::new(inode, handle, inode_map.refcount, id, st.st.st_mode, inode_map.parent, inode_map.name.clone())),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn restore_handle(&self, handle: Handle, handle_map: &HandleMapData) -> io::Result<()> {
+        let file = self.open_inode(handle_map.inode, handle_map.open_flags as i32)?;
+        let data = HandleData::new(handle_map.inode, file, handle_map.open_flags);
+        self.handle_map.insert(handle, data);
+        Ok(())
+    }
+
+    // Restore from snapshot
+    pub fn do_restore(&self, snapshot_store: SnapshotStore, capable: FsOptions) -> io::Result<()> {
+        self.do_restore_init(capable)?;
+
+        for (inode, inode_map) in snapshot_store.inode_map.iter() {
+            if *inode == fuse::ROOT_ID {
+                continue;
+            }
+
+            self.restore_inode(*inode, inode_map)
+                .map_err(|e| {
+                    error!("restore_inode failed with inode: {:?} and name: {:?}", inode_map.inode, inode_map.name);
+                    e
+                })?;
+        }
+
+        for (handle, handle_map) in snapshot_store.handle_map.iter() {
+            self.restore_handle(*handle, handle_map)
+                .map_err(|e| {
+                    error!("restore_handle failed with handle: {:?} and inode: {:?}", handle, handle_map.inode);
+                    e
+                })?;
+        }
+
+        self.next_handle.store(snapshot_store.next_handle, Ordering::Relaxed);
+        self.next_inode.store(snapshot_store.next_inode, Ordering::Relaxed);
+
+        Ok(())
     }
 
     fn readlinkat(dfd: i32, pathname: &CStr) -> io::Result<PathBuf> {
@@ -713,8 +900,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
-                        Arc::new(InodeData::new(inode, handle, 1, id, st.st.st_mode)),
+                        Arc::new(InodeData::new(inode, handle, 1, id, st.st.st_mode, parent, name.clone().to_str().unwrap().to_string())),
                     );
+
                     inode
                 }
             }
@@ -1434,7 +1622,7 @@ mod tests {
             let file = TempFile::new().expect("Cannot create temporary file.");
             let mode = file.as_file().metadata().unwrap().mode();
             let inode_data =
-                InodeData::new(inode, InodeHandle::File(file.into_file()), 1, id, mode);
+                InodeData::new(inode, InodeHandle::File(file.into_file()), 1, id, mode, 1, "".to_string());
             m.insert(Arc::new(inode_data));
             let inode = fs.allocate_inode(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
