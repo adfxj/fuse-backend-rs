@@ -345,18 +345,13 @@ impl HandleMap {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeParent {
     inode: Inode,
-    id: InodeId,
-    // File type and mode
-    mode: u32,
     name: String,
 }
 
 impl InodeParent {
-    fn new(inode: Inode, id: InodeId, mode: u32, name: String) -> Self {
+    fn new(inode: Inode, name: String) -> Self {
         InodeParent {
             inode,
-            id,
-            mode,
             name,
         }
     }
@@ -626,7 +621,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // Save snapshot
         if self.cfg.do_snapshot {
-            self.snapshot_data.insert_parent(fuse::ROOT_ID, Arc::new(InodeParent::new(fuse::ROOT_ID, id, st.st.st_mode, self.cfg.root_dir.clone())));
+            self.snapshot_data.insert_parent(0, Arc::new(InodeParent::new(fuse::ROOT_ID, self.cfg.root_dir.clone())));
         }
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
@@ -645,11 +640,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn do_restore_import(&self, restore_node: Arc<InodeParent>) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let (path_fd, handle_opt, _st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
+        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
             .map_err(|e| {
                 error!("fuse: import: failed to get file or handle: {:?}", e);
                 e
             })?;
+        let id = InodeId::from_stat(&st);
         let handle = if let Some(h) = handle_opt {
             InodeHandle::Handle(self.to_openable_handle(h)?)
         } else {
@@ -663,7 +659,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // Save snapshot
         if self.cfg.do_snapshot {
-            self.snapshot_data.insert_parent(fuse::ROOT_ID, restore_node.clone());
+            self.snapshot_data.insert_parent(0, restore_node.clone());
         }
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
@@ -671,8 +667,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             fuse::ROOT_ID,
             handle,
             2,
-            restore_node.id,
-            restore_node.mode,
+            id,
+            st.st.st_mode,
         )));
 
         Ok(())
@@ -717,7 +713,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         self.do_restore_init(capable);
 
         for (inode, inode_parent) in snapshot_store.inode_parent.iter() {
-            if *inode == fuse::ROOT_ID {
+            if *inode == 0 {
                 self.do_restore_import(inode_parent.clone());
             } else {
                 self.do_restore_lookup(inode.clone(), inode_parent.clone());
@@ -1034,7 +1030,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     self.next_inode.fetch_add(1, Ordering::Relaxed);
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
-                        Arc::new(InodeData::new(inode, handle, 1, inode_parent.id, inode_parent.mode)),
+                        Arc::new(InodeData::new(inode, handle, 1, id, st.st.st_mode)),
                     );
 
                     if self.cfg.do_snapshot {
@@ -1137,7 +1133,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                         SnapshotData::insert_parent_locked(
                             snapshot_store.deref_mut(),
                             inode,
-                            Arc::new(InodeParent::new(parent, id,  st.st.st_mode, name.clone().to_str().unwrap().to_string())),
+                            Arc::new(InodeParent::new(parent, name.clone().to_str().unwrap().to_string())),
                         );
                     }
 
