@@ -411,6 +411,8 @@ pub struct SnapshotStore {
     inode_parent: BTreeMap<Inode, Arc<InodeParent>>,
     handle_open: BTreeMap<Inode, Arc<HandelOpen>>,
     handle_create: BTreeMap<Inode, Arc<HandelCreate>>,
+    next_inode: u64,
+    next_handle: u64,
 }
 
 #[derive(Debug, Default)]
@@ -729,6 +731,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             let name = name.as_c_str();
             self.do_restore_create(handle_create.uid, handle_create.gid, handle_create.inode, name, handle_create.args, handle_create.handle);
         }
+
+        self.next_handle.store(snapshot_store.next_handle, Ordering::Relaxed);
+        self.next_inode.store(snapshot_store.next_inode, Ordering::Relaxed);
     }
 
     fn do_restore_open(

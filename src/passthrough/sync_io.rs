@@ -1358,6 +1358,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
 
     fn get_snapshot(&self, _idx: u8) -> io::Result<SnapshotStore> {
+        let mut snapshot_data = self.snapshot_data.get_map().clone();
+        snapshot_data.next_handle = self.next_handle.load(Ordering::Relaxed);
+        snapshot_data.next_inode = self.next_inode.load(Ordering::Relaxed);
         Ok(self.snapshot_data.get_map().clone())
     }
 }
