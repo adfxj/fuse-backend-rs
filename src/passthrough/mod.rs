@@ -729,7 +729,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         for (_key, handle_create) in snapshot_store.handle_create.iter() {
             let name = CString::new(handle_create.name.clone()).expect("Cstring: failed");
             let name = name.as_c_str();
-            self.do_restore_create(handle_create.uid, handle_create.gid, handle_create.inode, name, handle_create.args, handle_create.handle);
+            //self.do_restore_create(handle_create.uid, handle_create.gid, handle_create.inode, name, handle_create.args, handle_create.handle);
+            self.do_restore_open(handle_create.inode, handle_create.args.flags, 1, handle_create.handle);
         }
 
         self.next_handle.store(snapshot_store.next_handle, Ordering::Relaxed);
