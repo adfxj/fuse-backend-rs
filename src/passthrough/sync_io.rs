@@ -199,16 +199,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handle_map.insert(handle, data);
 
-        // Save snapshot if needed
-        if self.cfg.do_snapshot {
-            let mut snapshot_store = self.snapshot_data.get_map_mut();
-            SnapshotData::insert_open_locked(
-                snapshot_store.deref_mut(),
-                inode,
-                Arc::new(HandelOpen::new(inode, flags, fuse_flags, handle)),
-            );
-        }
-
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
             // We only set the direct I/O option on files.
@@ -356,10 +346,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     fn destroy(&self) {
         self.handle_map.clear();
         self.inode_map.clear();
-
-        if self.cfg.do_snapshot {
-            self.snapshot_data.clear();
-        }
 
         if let Err(e) = self.import() {
             error!("fuse: failed to destroy instance, {:?}", e);
@@ -608,15 +594,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let data = HandleData::new(entry.inode, file, args.flags);
 
             self.handle_map.insert(handle, data);
-            // Save snapshot if needed
-            if self.cfg.do_snapshot {
-                let mut snapshot_store = self.snapshot_data.get_map_mut();
-                SnapshotData::insert_create_locked(
-                    snapshot_store.deref_mut(),
-                    parent,
-                    Arc::new(HandelCreate::new(ctx.uid, ctx.gid, parent, name.to_str().unwrap().to_string(), args, handle)),
-                );
-            }
 
             Some(handle)
         } else {
@@ -1358,10 +1335,37 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
 
     fn get_snapshot(&self, _idx: u8) -> io::Result<SnapshotStore> {
-        let mut snapshot_data = self.snapshot_data.get_map().clone();
+        let mut snapshot_data = SnapshotStore::new();
         snapshot_data.next_handle = self.next_handle.load(Ordering::Relaxed);
         snapshot_data.next_inode = self.next_inode.load(Ordering::Relaxed);
-        Ok(self.snapshot_data.get_map().clone())
+
+        for (inode, data) in self.inode_map.inodes.read().unwrap().data.iter() {
+            snapshot_data.inode_map.insert(
+                *inode,
+                Arc::new(
+                    InodeMapData {
+                        inode: data.inode,
+                        id: data.id,
+                        refcount: data.refcount.load(Ordering::Relaxed),
+                        mode: data.mode,
+                        parent: data.parent,
+                        name: data.name.clone(),
+                    }
+                ));
+        }
+
+        for (handle, data) in self.handle_map.handles.read().unwrap().iter() {
+            snapshot_data.handle_map.insert(
+                *handle,
+                Arc::new(
+                    HandleMapData {
+                        inode: data.inode,
+                        open_flags: data.open_flags.load(Ordering::Relaxed),
+                    }
+                ));
+        }
+
+        Ok(snapshot_data)
     }
 }
 

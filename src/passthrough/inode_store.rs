@@ -31,7 +31,7 @@ impl InodeId {
 
 #[derive(Default)]
 pub struct InodeStore {
-    data: BTreeMap<Inode, Arc<InodeData>>,
+    pub data: BTreeMap<Inode, Arc<InodeData>>,
     by_id: BTreeMap<InodeId, Inode>,
     by_handle: BTreeMap<Arc<FileHandle>, Inode>,
 }
@@ -170,8 +170,8 @@ mod test {
         let id2 = InodeId::from_stat(&inode_stat2);
         let file_or_handle1 = InodeHandle::File(tmpfile1.into_file());
         let file_or_handle2 = InodeHandle::File(tmpfile2.into_file());
-        let data1 = InodeData::new(inode1, file_or_handle1, 2, id1, inode_stat1.st.st_mode);
-        let data2 = InodeData::new(inode2, file_or_handle2, 2, id2, inode_stat2.st.st_mode);
+        let data1 = InodeData::new(inode1, file_or_handle1, 2, id1, inode_stat1.st.st_mode, 1, "".to_string());
+        let data2 = InodeData::new(inode2, file_or_handle2, 2, id2, inode_stat2.st.st_mode, 1, "".to_string());
         let data1 = Arc::new(data1);
         let data2 = Arc::new(data2);
 
