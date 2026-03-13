@@ -585,7 +585,27 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let dir = self.inode_map.get(inode_map.parent)?;
         let dir_file = dir.get_file()?;
-        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &dir_file, name)?;
+        let (path_fd, handle_opt, st) =  match
+        Self::open_file_and_handle(self, &dir_file, name) {
+            Ok(res) => res,
+            Err(e) => match e.kind() {
+                io::ErrorKind::NotFound => {
+                    if self.cfg.cache_policy != CachePolicy::Never {
+                        // If the cache policy is not "never" (i.e., caching is allowed),
+                        // even if the file is missing (e.g., the cache file hasn't been
+                        // written yet or was deleted by the client),
+                        // we should return without error to ensure program stability.
+                        return Ok(());
+                    } else {
+                        return Err(e);
+                    }
+                }
+                _ => {
+                    error!("fuse: restore_inode: failed to get file or handle: {:?}", e);
+                    return Err(e);
+                }
+            }
+        };
         let id = InodeId::from_stat(&st);
 
         let mut found = None;
