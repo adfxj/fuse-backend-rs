@@ -12,7 +12,7 @@
 //! with heavy modification/enhancements from Alibaba Cloud OS team.
 
 use std::any::Any;
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{btree_map, BTreeMap, HashSet};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
@@ -681,24 +681,53 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn do_restore(&self, snapshot_store: SnapshotStore, capable: FsOptions) -> io::Result<()> {
         self.do_restore_init(capable)?;
 
-        for (inode, inode_map) in snapshot_store.inode_map.iter() {
-            if *inode == fuse::ROOT_ID {
-                continue;
+        let mut processed = HashSet::new();
+        let mut retry_queue: Vec<_> = snapshot_store.inode_map.iter()
+            .filter(|(&inode, _)| inode != fuse::ROOT_ID)
+            .map(|(&inode, im)| (inode, im))
+            .collect();
+
+        while !retry_queue.is_empty() {
+            let mut next_round = Vec::new();
+            let mut made_progress = false;
+
+            for (inode, inode_map) in retry_queue.drain(..) {
+                if inode_map.parent != fuse::ROOT_ID && !processed.contains(&inode_map.parent) {
+                    next_round.push((inode, inode_map));
+                    continue;
+                }
+
+                match self.restore_inode(inode, &inode_map) {
+                    Ok(_) => {
+                        processed.insert(inode);
+                        made_progress = true;
+                    }
+                    Err(e) => {
+                        if inode_map.parent == fuse::ROOT_ID || processed.contains(&inode_map.parent) {
+                            warn!(
+                                "restore_inode: failed, inode={}, name={:?}, error={:?}",
+                                inode, inode_map.name, e
+                            );
+                        } else {
+                            next_round.push((inode, inode_map));
+                        }
+                    }
+                }
             }
 
-            self.restore_inode(*inode, inode_map)
-                .map_err(|e| {
-                    error!("restore_inode failed with inode: {:?} and name: {:?}", inode_map.inode, inode_map.name);
-                    e
-                })?;
+            if !made_progress && !next_round.is_empty() {
+                error!("Deadlock: unresolved inodes {:?}", next_round);
+                return Err(io::Error::new(io::ErrorKind::Other, "Deadlock: unresolved inodes"));
+            }
+            retry_queue = next_round;
         }
 
         for (handle, handle_map) in snapshot_store.handle_map.iter() {
-            self.restore_handle(*handle, handle_map)
+            let _ = self.restore_handle(*handle, handle_map)
                 .map_err(|e| {
-                    error!("restore_handle failed with handle: {:?} and inode: {:?}", handle, handle_map.inode);
+                    warn!("restore_handle failed with handle: {:?} and inode: {:?}", handle, handle_map.inode);
                     e
-                })?;
+                });
         }
 
         self.next_handle.store(snapshot_store.next_handle, Ordering::Relaxed);
