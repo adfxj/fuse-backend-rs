@@ -12,7 +12,7 @@
 //! with heavy modification/enhancements from Alibaba Cloud OS team.
 
 use std::any::Any;
-use std::collections::{btree_map, BTreeMap, HashSet};
+use std::collections::{btree_map, BTreeMap, HashSet, HashMap};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
@@ -378,6 +378,41 @@ impl SnapshotStore {
             handle_map: BTreeMap::new(),
             next_inode: 0,
             next_handle: 0,
+        }
+    }
+
+    pub fn deduplicate_inode(&mut self) {
+        let mut groups: HashMap<(Inode, String), Vec<(Inode, bool)>> = HashMap::new();
+
+        for (inode, data) in self.inode_map.iter() {
+            let key = (data.parent, data.name.clone());
+            let in_handle_map = self.handle_map
+                .values()
+                .any(|handle_data| handle_data.inode == *inode);
+            groups.entry(key).or_default().push((*inode, in_handle_map));
+        }
+
+        let mut to_remove = Vec::new();
+        for (_, group) in groups {
+            if group.len() > 1 {
+                let mut non_handled: Vec<Inode> = group.iter()
+                    .filter(|(_, in_handle)| !*in_handle)
+                    .map(|(inode, _)| *inode)
+                    .collect();
+
+                if non_handled.len() == group.len() {
+                    let max_inode = non_handled.iter().max().copied();
+                    if let Some(max_inode) = max_inode {
+                        non_handled.retain(|inode| *inode != max_inode);
+                    }
+                }
+
+                to_remove.extend(non_handled);
+            }
+        }
+
+        for inode in to_remove {
+            self.inode_map.remove(&inode);
         }
     }
 }
