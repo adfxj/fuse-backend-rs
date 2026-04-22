@@ -727,7 +727,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             let mut made_progress = false;
 
             for (inode, inode_map) in retry_queue.drain(..) {
-                if inode_map.parent != fuse::ROOT_ID && !processed.contains(&inode_map.parent) {
+                let parent_exists = inode_map.parent == fuse::ROOT_ID 
+                    || snapshot_store.inode_map.contains_key(&inode_map.parent);
+                if parent_exists && inode_map.parent != fuse::ROOT_ID && !processed.contains(&inode_map.parent) {
                     next_round.push((inode, inode_map));
                     continue;
                 }
@@ -743,6 +745,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                                 "restore_inode: failed, inode={}, name={:?}, error={:?}",
                                 inode, inode_map.name, e
                             );
+                        } else if !parent_exists {
+                            warn!(
+                                "restore_inode: failed and parent not found, inode={}, name={:?}, error={:?}",
+                                inode, inode_map.name, e
+                            );
+                            made_progress = true;
                         } else {
                             next_round.push((inode, inode_map));
                         }
