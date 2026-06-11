@@ -18,6 +18,7 @@ use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, FsOptions, OpenOptions, 
 #[cfg(feature = "virtiofs")]
 pub use crate::abi::virtio_fs::RemovemappingOne;
 use crate::api::VfsIndex;
+#[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 use crate::passthrough::SnapshotStore;
 #[cfg(feature = "virtiofs")]
 use crate::transport::FsCacheReqHandler;
@@ -905,6 +906,7 @@ pub trait FileSystem {
         Ok(())
     }
 
+    #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
     fn get_snapshot(&self, idx: VfsIndex) -> io::Result<SnapshotStore> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -1359,6 +1361,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         self.deref().id_remap(ctx)
     }
 
+    #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
     fn get_snapshot(&self, idx: VfsIndex) -> io::Result<SnapshotStore> {
         self.deref().get_snapshot(idx)
     }

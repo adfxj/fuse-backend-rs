@@ -7,6 +7,7 @@ use super::*;
 use crate::abi::fuse_abi::{stat64, statvfs64};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
+#[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 use crate::passthrough::SnapshotStore;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
@@ -695,6 +696,7 @@ impl FileSystem for Vfs {
         }
     }
 
+    #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
     fn get_snapshot(&self, idx: VfsIndex) -> Result<SnapshotStore> {
         match self.get_real_rootfs(VfsInode::new(idx, 1))? {
             (Left(fs), _idata) => fs.get_snapshot(idx),
